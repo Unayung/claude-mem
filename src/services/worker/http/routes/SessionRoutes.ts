@@ -81,15 +81,15 @@ export class SessionRoutes extends BaseRouteHandler {
   /**
    * Initialize a new session
    */
-  private handleSessionInit = this.wrapHandler((req: Request, res: Response): void => {
+  private handleSessionInit = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     const sessionDbId = this.parseIntParam(req, res, 'sessionDbId');
     if (sessionDbId === null) return;
 
     const { userPrompt, promptNumber } = req.body;
-    const session = this.sessionManager.initializeSession(sessionDbId, userPrompt, promptNumber);
+    const session = await this.sessionManager.initializeSession(sessionDbId, userPrompt, promptNumber);
 
     // Get the latest user_prompt for this session to sync to Chroma
-    const latestPrompt = this.dbManager.getSessionStore().getLatestUserPrompt(session.claudeSessionId);
+    const latestPrompt = await Promise.resolve(this.dbManager.getSessionStore().getLatestUserPrompt(session.claudeSessionId));
 
     // Broadcast new prompt to SSE clients (for web UI)
     if (latestPrompt) {
@@ -159,13 +159,13 @@ export class SessionRoutes extends BaseRouteHandler {
    * Queue observations for processing
    * CRITICAL: Ensures SDK agent is running to process the queue (ALWAYS SAVE EVERYTHING)
    */
-  private handleObservations = this.wrapHandler((req: Request, res: Response): void => {
+  private handleObservations = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     const sessionDbId = this.parseIntParam(req, res, 'sessionDbId');
     if (sessionDbId === null) return;
 
     const { tool_name, tool_input, tool_response, prompt_number, cwd } = req.body;
 
-    this.sessionManager.queueObservation(sessionDbId, {
+    await this.sessionManager.queueObservation(sessionDbId, {
       tool_name,
       tool_input,
       tool_response,
@@ -186,13 +186,13 @@ export class SessionRoutes extends BaseRouteHandler {
    * Queue summarize request
    * CRITICAL: Ensures SDK agent is running to process the queue (ALWAYS SAVE EVERYTHING)
    */
-  private handleSummarize = this.wrapHandler((req: Request, res: Response): void => {
+  private handleSummarize = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     const sessionDbId = this.parseIntParam(req, res, 'sessionDbId');
     if (sessionDbId === null) return;
 
     const { last_user_message, last_assistant_message } = req.body;
 
-    this.sessionManager.queueSummarize(sessionDbId, last_user_message, last_assistant_message);
+    await this.sessionManager.queueSummarize(sessionDbId, last_user_message, last_assistant_message);
 
     // CRITICAL: Ensure SDK agent is running to consume the queue
     this.ensureGeneratorRunning(sessionDbId, 'summarize');
@@ -256,7 +256,7 @@ export class SessionRoutes extends BaseRouteHandler {
    * POST /api/sessions/observations
    * Body: { claudeSessionId, tool_name, tool_input, tool_response, cwd }
    */
-  private handleObservationsByClaudeId = this.wrapHandler((req: Request, res: Response): void => {
+  private handleObservationsByClaudeId = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     const { claudeSessionId, tool_name, tool_input, tool_response, cwd } = req.body;
 
     if (!claudeSessionId) {
@@ -295,12 +295,12 @@ export class SessionRoutes extends BaseRouteHandler {
 
     const store = this.dbManager.getSessionStore();
 
-    // Get or create session
-    const sessionDbId = store.createSDKSession(claudeSessionId, '', '');
-    const promptNumber = store.getPromptCounter(sessionDbId);
+    // Get or create session (PostgreSQL is async, SQLite is sync - await handles both)
+    const sessionDbId = await Promise.resolve(store.createSDKSession(claudeSessionId, '', ''));
+    const promptNumber = await Promise.resolve(store.getPromptCounter(sessionDbId));
 
     // Privacy check: skip if user prompt was entirely private
-    const userPrompt = PrivacyCheckValidator.checkUserPromptPrivacy(
+    const userPrompt = await PrivacyCheckValidator.checkUserPromptPrivacy(
       store,
       claudeSessionId,
       promptNumber,
@@ -336,7 +336,7 @@ export class SessionRoutes extends BaseRouteHandler {
     }
 
     // Queue observation
-    this.sessionManager.queueObservation(sessionDbId, {
+    await this.sessionManager.queueObservation(sessionDbId, {
       tool_name,
       tool_input: cleanedToolInput,
       tool_response: cleanedToolResponse,
@@ -366,7 +366,7 @@ export class SessionRoutes extends BaseRouteHandler {
    *
    * Checks privacy, queues summarize request for SDK agent
    */
-  private handleSummarizeByClaudeId = this.wrapHandler((req: Request, res: Response): void => {
+  private handleSummarizeByClaudeId = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     const { claudeSessionId, last_user_message, last_assistant_message } = req.body;
 
     if (!claudeSessionId) {
@@ -375,12 +375,12 @@ export class SessionRoutes extends BaseRouteHandler {
 
     const store = this.dbManager.getSessionStore();
 
-    // Get or create session
-    const sessionDbId = store.createSDKSession(claudeSessionId, '', '');
-    const promptNumber = store.getPromptCounter(sessionDbId);
+    // Get or create session (PostgreSQL is async, SQLite is sync - await handles both)
+    const sessionDbId = await Promise.resolve(store.createSDKSession(claudeSessionId, '', ''));
+    const promptNumber = await Promise.resolve(store.getPromptCounter(sessionDbId));
 
     // Privacy check: skip if user prompt was entirely private
-    const userPrompt = PrivacyCheckValidator.checkUserPromptPrivacy(
+    const userPrompt = await PrivacyCheckValidator.checkUserPromptPrivacy(
       store,
       claudeSessionId,
       promptNumber,
@@ -393,7 +393,7 @@ export class SessionRoutes extends BaseRouteHandler {
     }
 
     // Queue summarize
-    this.sessionManager.queueSummarize(
+    await this.sessionManager.queueSummarize(
       sessionDbId,
       last_user_message || logger.happyPathError(
         'SESSION',
@@ -451,7 +451,7 @@ export class SessionRoutes extends BaseRouteHandler {
    *
    * Returns: { sessionDbId, promptNumber, skipped: boolean, reason?: string }
    */
-  private handleSessionInitByClaudeId = this.wrapHandler((req: Request, res: Response): void => {
+  private handleSessionInitByClaudeId = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     const { claudeSessionId, project, prompt } = req.body;
 
     // Validate required parameters
@@ -462,10 +462,11 @@ export class SessionRoutes extends BaseRouteHandler {
     const store = this.dbManager.getSessionStore();
 
     // Step 1: Create/get SDK session (idempotent INSERT OR IGNORE)
-    const sessionDbId = store.createSDKSession(claudeSessionId, project, prompt);
+    // Note: PostgreSQL version is async, SQLite is sync - await handles both
+    const sessionDbId = await Promise.resolve(store.createSDKSession(claudeSessionId, project, prompt));
 
     // Step 2: Increment prompt counter
-    const promptNumber = store.incrementPromptCounter(sessionDbId);
+    const promptNumber = await Promise.resolve(store.incrementPromptCounter(sessionDbId));
 
     // Step 3: Strip privacy tags from prompt
     const cleanedPrompt = stripMemoryTagsFromPrompt(prompt);
@@ -488,7 +489,7 @@ export class SessionRoutes extends BaseRouteHandler {
     }
 
     // Step 5: Save cleaned user prompt
-    store.saveUserPrompt(claudeSessionId, promptNumber, cleanedPrompt);
+    await Promise.resolve(store.saveUserPrompt(claudeSessionId, promptNumber, cleanedPrompt));
 
     logger.info('SESSION', 'Session initialized via HTTP', {
       sessionId: sessionDbId,

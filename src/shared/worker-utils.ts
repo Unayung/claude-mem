@@ -18,7 +18,7 @@ let cachedPort: number | null = null;
 
 /**
  * Get the worker port number from settings
- * Uses CLAUDE_MEM_WORKER_PORT from settings file or default (37777)
+ * Priority: ENV var > settings file > default
  * Caches the port value to avoid repeated file reads
  */
 export function getWorkerPort(): number {
@@ -26,6 +26,16 @@ export function getWorkerPort(): number {
     return cachedPort;
   }
 
+  // 1. Check environment variable first (highest priority)
+  if (process.env.CLAUDE_MEM_WORKER_PORT) {
+    const envPort = parseInt(process.env.CLAUDE_MEM_WORKER_PORT, 10);
+    if (!isNaN(envPort) && envPort >= 1024 && envPort <= 65535) {
+      cachedPort = envPort;
+      return cachedPort;
+    }
+  }
+
+  // 2. Try settings file
   try {
     const settingsPath = path.join(SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR'), 'settings.json');
     const settings = SettingsDefaultsManager.loadFromFile(settingsPath);

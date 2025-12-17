@@ -5,16 +5,51 @@
  * - DRY helper for paginated queries
  * - Eliminates copy-paste across observations/summaries/prompts endpoints
  * - Efficient LIMIT+1 trick to avoid COUNT(*) query
+ * - Supports both SQLite (sync) and PostgreSQL (async) backends
  */
 
 import { DatabaseManager } from './DatabaseManager.js';
 import type { PaginatedResult, Observation, Summary, UserPrompt } from '../worker-types.js';
 
+// PostgreSQL query function (dynamic import to avoid loading when using SQLite)
+type QueryFn = typeof import('../postgres/pool.js').query;
+
 export class PaginationHelper {
   private dbManager: DatabaseManager;
+  private pgQuery: QueryFn | null = null;
 
   constructor(dbManager: DatabaseManager) {
     this.dbManager = dbManager;
+  }
+
+  /**
+   * Get PostgreSQL query function (lazy load)
+   */
+  private async getPgQuery(): Promise<QueryFn> {
+    if (!this.pgQuery) {
+      const { query } = await import('../postgres/pool.js');
+      this.pgQuery = query;
+    }
+    return this.pgQuery;
+  }
+
+  /**
+   * Check if using PostgreSQL backend
+   */
+  private isPostgres(): boolean {
+    return this.dbManager.isPostgres();
+  }
+
+  /**
+   * Coerce PostgreSQL BIGINT strings to numbers for epoch timestamps
+   * PostgreSQL returns BIGINT as strings to avoid JS precision issues,
+   * but our epoch timestamps are well within safe integer range.
+   */
+  private coerceEpochToNumber<T extends { created_at_epoch?: string | number }>(item: T): T {
+    if (item.created_at_epoch !== undefined && typeof item.created_at_epoch === 'string') {
+      return { ...item, created_at_epoch: parseInt(item.created_at_epoch, 10) };
+    }
+    return item;
   }
 
   /**
@@ -70,8 +105,8 @@ export class PaginationHelper {
   /**
    * Get paginated observations
    */
-  getObservations(offset: number, limit: number, project?: string): PaginatedResult<Observation> {
-    const result = this.paginate<Observation>(
+  async getObservations(offset: number, limit: number, project?: string): Promise<PaginatedResult<Observation>> {
+    const result = await this.paginate<Observation>(
       'observations',
       'id, sdk_session_id, project, type, title, subtitle, narrative, text, facts, concepts, files_read, files_modified, prompt_number, created_at, created_at_epoch',
       offset,
@@ -89,7 +124,47 @@ export class PaginationHelper {
   /**
    * Get paginated summaries
    */
-  getSummaries(offset: number, limit: number, project?: string): PaginatedResult<Summary> {
+  async getSummaries(offset: number, limit: number, project?: string): Promise<PaginatedResult<Summary>> {
+    if (this.isPostgres()) {
+      const pgQuery = await this.getPgQuery();
+      let sql = `
+        SELECT
+          ss.id,
+          s.claude_session_id as session_id,
+          ss.request,
+          ss.investigated,
+          ss.learned,
+          ss.completed,
+          ss.next_steps,
+          ss.project,
+          ss.created_at,
+          ss.created_at_epoch
+        FROM session_summaries ss
+        JOIN sdk_sessions s ON ss.sdk_session_id = s.sdk_session_id
+      `;
+      const params: any[] = [];
+      let paramIndex = 1;
+
+      if (project) {
+        sql += ` WHERE ss.project = $${paramIndex++}`;
+        params.push(project);
+      }
+
+      sql += ` ORDER BY ss.created_at_epoch DESC LIMIT $${paramIndex++} OFFSET $${paramIndex}`;
+      params.push(limit + 1, offset);
+
+      const result = await pgQuery<Summary>(sql, params);
+      // Coerce BIGINT epoch strings to numbers for PostgreSQL
+      const items = result.rows.slice(0, limit).map(row => this.coerceEpochToNumber(row));
+      return {
+        items,
+        hasMore: result.rows.length > limit,
+        offset,
+        limit
+      };
+    }
+
+    // SQLite
     const db = this.dbManager.getSessionStore().db;
 
     let query = `
@@ -131,7 +206,37 @@ export class PaginationHelper {
   /**
    * Get paginated user prompts
    */
-  getPrompts(offset: number, limit: number, project?: string): PaginatedResult<UserPrompt> {
+  async getPrompts(offset: number, limit: number, project?: string): Promise<PaginatedResult<UserPrompt>> {
+    if (this.isPostgres()) {
+      const pgQuery = await this.getPgQuery();
+      let sql = `
+        SELECT up.id, up.claude_session_id, s.project, up.prompt_number, up.prompt_text, up.created_at, up.created_at_epoch
+        FROM user_prompts up
+        JOIN sdk_sessions s ON up.claude_session_id = s.claude_session_id
+      `;
+      const params: any[] = [];
+      let paramIndex = 1;
+
+      if (project) {
+        sql += ` WHERE s.project = $${paramIndex++}`;
+        params.push(project);
+      }
+
+      sql += ` ORDER BY up.created_at_epoch DESC LIMIT $${paramIndex++} OFFSET $${paramIndex}`;
+      params.push(limit + 1, offset);
+
+      const result = await pgQuery<UserPrompt>(sql, params);
+      // Coerce BIGINT epoch strings to numbers for PostgreSQL
+      const items = result.rows.slice(0, limit).map(row => this.coerceEpochToNumber(row));
+      return {
+        items,
+        hasMore: result.rows.length > limit,
+        offset,
+        limit
+      };
+    }
+
+    // SQLite
     const db = this.dbManager.getSessionStore().db;
 
     let query = `
@@ -163,13 +268,41 @@ export class PaginationHelper {
   /**
    * Generic pagination implementation (DRY)
    */
-  private paginate<T>(
+  private async paginate<T>(
     table: string,
     columns: string,
     offset: number,
     limit: number,
     project?: string
-  ): PaginatedResult<T> {
+  ): Promise<PaginatedResult<T>> {
+    if (this.isPostgres()) {
+      const pgQuery = await this.getPgQuery();
+      let sql = `SELECT ${columns} FROM ${table}`;
+      const params: any[] = [];
+      let paramIndex = 1;
+
+      if (project) {
+        sql += ` WHERE project = $${paramIndex++}`;
+        params.push(project);
+      }
+
+      sql += ` ORDER BY created_at_epoch DESC LIMIT $${paramIndex++} OFFSET $${paramIndex}`;
+      params.push(limit + 1, offset);
+
+      const result = await pgQuery<T>(sql, params);
+      // Coerce BIGINT epoch strings to numbers for PostgreSQL
+      const items = result.rows.slice(0, limit).map(row =>
+        this.coerceEpochToNumber(row as T & { created_at_epoch?: string | number }) as T
+      );
+      return {
+        items,
+        hasMore: result.rows.length > limit,
+        offset,
+        limit
+      };
+    }
+
+    // SQLite
     const db = this.dbManager.getSessionStore().db;
 
     let query = `SELECT ${columns} FROM ${table}`;

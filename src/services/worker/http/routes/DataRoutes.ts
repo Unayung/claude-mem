@@ -58,27 +58,27 @@ export class DataRoutes extends BaseRouteHandler {
   /**
    * Get paginated observations
    */
-  private handleGetObservations = this.wrapHandler((req: Request, res: Response): void => {
+  private handleGetObservations = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     const { offset, limit, project } = this.parsePaginationParams(req);
-    const result = this.paginationHelper.getObservations(offset, limit, project);
+    const result = await this.paginationHelper.getObservations(offset, limit, project);
     res.json(result);
   });
 
   /**
    * Get paginated summaries
    */
-  private handleGetSummaries = this.wrapHandler((req: Request, res: Response): void => {
+  private handleGetSummaries = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     const { offset, limit, project } = this.parsePaginationParams(req);
-    const result = this.paginationHelper.getSummaries(offset, limit, project);
+    const result = await this.paginationHelper.getSummaries(offset, limit, project);
     res.json(result);
   });
 
   /**
    * Get paginated user prompts
    */
-  private handleGetPrompts = this.wrapHandler((req: Request, res: Response): void => {
+  private handleGetPrompts = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     const { offset, limit, project } = this.parsePaginationParams(req);
-    const result = this.paginationHelper.getPrompts(offset, limit, project);
+    const result = await this.paginationHelper.getPrompts(offset, limit, project);
     res.json(result);
   });
 
@@ -86,12 +86,13 @@ export class DataRoutes extends BaseRouteHandler {
    * Get observation by ID
    * GET /api/observation/:id
    */
-  private handleGetObservationById = this.wrapHandler((req: Request, res: Response): void => {
+  private handleGetObservationById = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     const id = this.parseIntParam(req, res, 'id');
     if (id === null) return;
 
     const store = this.dbManager.getSessionStore();
-    const observation = store.getObservationById(id);
+    // Await handles both sync (SQLite) and async (PostgreSQL) stores
+    const observation = await Promise.resolve(store.getObservationById(id));
 
     if (!observation) {
       this.notFound(res, `Observation #${id} not found`);
@@ -106,7 +107,7 @@ export class DataRoutes extends BaseRouteHandler {
    * POST /api/observations/batch
    * Body: { ids: number[], orderBy?: 'date_desc' | 'date_asc', limit?: number, project?: string }
    */
-  private handleGetObservationsByIds = this.wrapHandler((req: Request, res: Response): void => {
+  private handleGetObservationsByIds = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     const { ids, orderBy, limit, project } = req.body;
 
     if (!ids || !Array.isArray(ids)) {
@@ -126,7 +127,8 @@ export class DataRoutes extends BaseRouteHandler {
     }
 
     const store = this.dbManager.getSessionStore();
-    const observations = store.getObservationsByIds(ids, { orderBy, limit, project });
+    // Await handles both sync (SQLite) and async (PostgreSQL) stores
+    const observations = await Promise.resolve(store.getObservationsByIds(ids, { orderBy, limit, project }));
 
     res.json(observations);
   });
@@ -135,12 +137,13 @@ export class DataRoutes extends BaseRouteHandler {
    * Get session by ID
    * GET /api/session/:id
    */
-  private handleGetSessionById = this.wrapHandler((req: Request, res: Response): void => {
+  private handleGetSessionById = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     const id = this.parseIntParam(req, res, 'id');
     if (id === null) return;
 
     const store = this.dbManager.getSessionStore();
-    const sessions = store.getSessionSummariesByIds([id]);
+    // Await handles both sync (SQLite) and async (PostgreSQL) stores
+    const sessions = await Promise.resolve(store.getSessionSummariesByIds([id]));
 
     if (sessions.length === 0) {
       this.notFound(res, `Session #${id} not found`);
@@ -155,7 +158,7 @@ export class DataRoutes extends BaseRouteHandler {
    * POST /api/sdk-sessions/batch
    * Body: { sdkSessionIds: string[] }
    */
-  private handleGetSdkSessionsByIds = this.wrapHandler((req: Request, res: Response): void => {
+  private handleGetSdkSessionsByIds = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     const { sdkSessionIds } = req.body;
 
     if (!Array.isArray(sdkSessionIds)) {
@@ -164,7 +167,8 @@ export class DataRoutes extends BaseRouteHandler {
     }
 
     const store = this.dbManager.getSessionStore();
-    const sessions = store.getSdkSessionsBySessionIds(sdkSessionIds);
+    // Await handles both sync (SQLite) and async (PostgreSQL) stores
+    const sessions = await Promise.resolve(store.getSdkSessionsBySessionIds(sdkSessionIds));
     res.json(sessions);
   });
 
@@ -172,12 +176,13 @@ export class DataRoutes extends BaseRouteHandler {
    * Get user prompt by ID
    * GET /api/prompt/:id
    */
-  private handleGetPromptById = this.wrapHandler((req: Request, res: Response): void => {
+  private handleGetPromptById = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     const id = this.parseIntParam(req, res, 'id');
     if (id === null) return;
 
     const store = this.dbManager.getSessionStore();
-    const prompts = store.getUserPromptsByIds([id]);
+    // Await handles both sync (SQLite) and async (PostgreSQL) stores
+    const prompts = await Promise.resolve(store.getUserPromptsByIds([id]));
 
     if (prompts.length === 0) {
       this.notFound(res, `Prompt #${id} not found`);
@@ -190,25 +195,45 @@ export class DataRoutes extends BaseRouteHandler {
   /**
    * Get database statistics (with worker metadata)
    */
-  private handleGetStats = this.wrapHandler((req: Request, res: Response): void => {
-    const db = this.dbManager.getSessionStore().db;
-
+  private handleGetStats = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     // Read version from package.json
     const packageRoot = getPackageRoot();
     const packageJsonPath = path.join(packageRoot, 'package.json');
     const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf-8'));
     const version = packageJson.version;
 
-    // Get database stats
-    const totalObservations = db.prepare('SELECT COUNT(*) as count FROM observations').get() as { count: number };
-    const totalSessions = db.prepare('SELECT COUNT(*) as count FROM sdk_sessions').get() as { count: number };
-    const totalSummaries = db.prepare('SELECT COUNT(*) as count FROM session_summaries').get() as { count: number };
-
-    // Get database file size and path
-    const dbPath = path.join(homedir(), '.claude-mem', 'claude-mem.db');
+    let totalObservations: number;
+    let totalSessions: number;
+    let totalSummaries: number;
+    let dbPath: string;
     let dbSize = 0;
-    if (existsSync(dbPath)) {
-      dbSize = statSync(dbPath).size;
+
+    if (this.dbManager.isPostgres()) {
+      // PostgreSQL
+      const { query } = await import('../../../postgres/pool.js');
+      const obsResult = await query<{ count: string }>('SELECT COUNT(*) as count FROM observations');
+      const sessResult = await query<{ count: string }>('SELECT COUNT(*) as count FROM sdk_sessions');
+      const sumResult = await query<{ count: string }>('SELECT COUNT(*) as count FROM session_summaries');
+
+      totalObservations = parseInt(obsResult.rows[0]?.count || '0', 10);
+      totalSessions = parseInt(sessResult.rows[0]?.count || '0', 10);
+      totalSummaries = parseInt(sumResult.rows[0]?.count || '0', 10);
+      dbPath = process.env.CLAUDE_MEM_DATABASE_URL || 'postgres://...';
+    } else {
+      // SQLite
+      const db = this.dbManager.getSessionStore().db;
+      const obsResult = db.prepare('SELECT COUNT(*) as count FROM observations').get() as { count: number };
+      const sessResult = db.prepare('SELECT COUNT(*) as count FROM sdk_sessions').get() as { count: number };
+      const sumResult = db.prepare('SELECT COUNT(*) as count FROM session_summaries').get() as { count: number };
+
+      totalObservations = obsResult.count;
+      totalSessions = sessResult.count;
+      totalSummaries = sumResult.count;
+
+      dbPath = path.join(homedir(), '.claude-mem', 'claude-mem.db');
+      if (existsSync(dbPath)) {
+        dbSize = statSync(dbPath).size;
+      }
     }
 
     // Worker metadata
@@ -222,14 +247,15 @@ export class DataRoutes extends BaseRouteHandler {
         uptime,
         activeSessions,
         sseClients,
-        port: getWorkerPort()
+        port: getWorkerPort(),
+        backend: this.dbManager.isPostgres() ? 'postgres' : 'sqlite'
       },
       database: {
         path: dbPath,
         size: dbSize,
-        observations: totalObservations.count,
-        sessions: totalSessions.count,
-        summaries: totalSummaries.count
+        observations: totalObservations,
+        sessions: totalSessions,
+        summaries: totalSummaries
       }
     });
   });
@@ -238,18 +264,32 @@ export class DataRoutes extends BaseRouteHandler {
    * Get list of distinct projects from observations
    * GET /api/projects
    */
-  private handleGetProjects = this.wrapHandler((req: Request, res: Response): void => {
-    const db = this.dbManager.getSessionStore().db;
+  private handleGetProjects = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
+    let projects: string[];
 
-    const rows = db.prepare(`
-      SELECT DISTINCT project
-      FROM observations
-      WHERE project IS NOT NULL
-      GROUP BY project
-      ORDER BY MAX(created_at_epoch) DESC
-    `).all() as Array<{ project: string }>;
-
-    const projects = rows.map(row => row.project);
+    if (this.dbManager.isPostgres()) {
+      // PostgreSQL - include aggregate in SELECT to satisfy ORDER BY requirement
+      const { query } = await import('../../../postgres/pool.js');
+      const result = await query<{ project: string }>(`
+        SELECT project, MAX(created_at_epoch) as last_activity
+        FROM observations
+        WHERE project IS NOT NULL
+        GROUP BY project
+        ORDER BY last_activity DESC
+      `);
+      projects = result.rows.map(row => row.project);
+    } else {
+      // SQLite - more lenient, works with implicit aggregate in ORDER BY
+      const db = this.dbManager.getSessionStore().db;
+      const rows = db.prepare(`
+        SELECT project
+        FROM observations
+        WHERE project IS NOT NULL
+        GROUP BY project
+        ORDER BY MAX(created_at_epoch) DESC
+      `).all() as Array<{ project: string }>;
+      projects = rows.map(row => row.project);
+    }
 
     res.json({ projects });
   });

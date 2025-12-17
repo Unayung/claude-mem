@@ -6,7 +6,8 @@ import { homedir } from 'os';
 import { DATA_DIR } from '../../shared/paths.js';
 import { getBunPath, isBunAvailable } from '../../utils/bun-path.js';
 
-const PID_FILE = join(DATA_DIR, 'worker.pid');
+// Port-specific PID files allow multiple workers to run on different ports
+const getPidFile = (port: number) => join(DATA_DIR, `worker-${port}.pid`);
 const LOG_DIR = join(DATA_DIR, 'logs');
 const MARKETPLACE_ROOT = join(homedir(), '.claude', 'plugins', 'marketplaces', 'thedotmack');
 
@@ -34,9 +35,9 @@ export class ProcessManager {
       };
     }
 
-    // Check if already running
-    if (await this.isRunning()) {
-      const info = this.getPidInfo();
+    // Check if already running on this specific port
+    if (await this.isRunningOnPort(port)) {
+      const info = this.getPidInfo(port);
       return { success: true, pid: info?.pid };
     }
 
@@ -115,7 +116,7 @@ export class ProcessManager {
         }
 
         // Write PID file
-        this.writePidFile({
+        this.writePidFile(port, {
           pid,
           port,
           startedAt: new Date().toISOString(),
@@ -145,7 +146,7 @@ export class ProcessManager {
         }
 
         // Write PID file
-        this.writePidFile({
+        this.writePidFile(port, {
           pid: child.pid,
           port,
           startedAt: new Date().toISOString(),
@@ -163,8 +164,9 @@ export class ProcessManager {
     }
   }
 
-  static async stop(timeout: number = PROCESS_STOP_TIMEOUT_MS): Promise<boolean> {
-    const info = this.getPidInfo();
+  static async stop(port?: number, timeout: number = PROCESS_STOP_TIMEOUT_MS): Promise<boolean> {
+    // If no port specified, try to find any running worker from existing PID files
+    const info = port ? this.getPidInfo(port) : this.findAnyRunningWorker();
     if (!info) return true;
 
     try {
@@ -178,17 +180,17 @@ export class ProcessManager {
       }
     }
 
-    this.removePidFile();
+    this.removePidFile(info.port);
     return true;
   }
 
   static async restart(port: number): Promise<{ success: boolean; pid?: number; error?: string }> {
-    await this.stop();
+    await this.stop(port);
     return this.start(port);
   }
 
-  static async status(): Promise<{ running: boolean; pid?: number; port?: number; uptime?: string }> {
-    const info = this.getPidInfo();
+  static async status(port?: number): Promise<{ running: boolean; pid?: number; port?: number; uptime?: string }> {
+    const info = port ? this.getPidInfo(port) : this.findAnyRunningWorker();
     if (!info) return { running: false };
 
     const running = this.isProcessAlive(info.pid);
@@ -200,21 +202,28 @@ export class ProcessManager {
     };
   }
 
-  static async isRunning(): Promise<boolean> {
-    const info = this.getPidInfo();
+  static async isRunningOnPort(port: number): Promise<boolean> {
+    const info = this.getPidInfo(port);
     if (!info) return false;
     const alive = this.isProcessAlive(info.pid);
     if (!alive) {
-      this.removePidFile(); // Clean up stale PID file
+      this.removePidFile(port); // Clean up stale PID file
     }
     return alive;
   }
 
+  // Legacy method for backward compatibility
+  static async isRunning(): Promise<boolean> {
+    const info = this.findAnyRunningWorker();
+    return info !== null && this.isProcessAlive(info.pid);
+  }
+
   // Helper methods
-  private static getPidInfo(): PidInfo | null {
+  private static getPidInfo(port: number): PidInfo | null {
     try {
-      if (!existsSync(PID_FILE)) return null;
-      const content = readFileSync(PID_FILE, 'utf-8');
+      const pidFile = getPidFile(port);
+      if (!existsSync(pidFile)) return null;
+      const content = readFileSync(pidFile, 'utf-8');
       const parsed = JSON.parse(content);
       // Validate required fields have correct types
       if (typeof parsed.pid !== 'number' || typeof parsed.port !== 'number') {
@@ -226,15 +235,42 @@ export class ProcessManager {
     }
   }
 
-  private static writePidFile(info: PidInfo): void {
-    mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(PID_FILE, JSON.stringify(info, null, 2));
+  /**
+   * Find any running worker by scanning PID files
+   * Used for backward compatibility when port is not specified
+   */
+  private static findAnyRunningWorker(): PidInfo | null {
+    try {
+      const { readdirSync } = require('fs');
+      const files = readdirSync(DATA_DIR) as string[];
+      for (const file of files) {
+        if (file.startsWith('worker-') && file.endsWith('.pid')) {
+          const portStr = file.replace('worker-', '').replace('.pid', '');
+          const port = parseInt(portStr, 10);
+          if (!isNaN(port)) {
+            const info = this.getPidInfo(port);
+            if (info && this.isProcessAlive(info.pid)) {
+              return info;
+            }
+          }
+        }
+      }
+    } catch {
+      // Ignore errors
+    }
+    return null;
   }
 
-  private static removePidFile(): void {
+  private static writePidFile(port: number, info: PidInfo): void {
+    mkdirSync(DATA_DIR, { recursive: true });
+    writeFileSync(getPidFile(port), JSON.stringify(info, null, 2));
+  }
+
+  private static removePidFile(port: number): void {
     try {
-      if (existsSync(PID_FILE)) {
-        unlinkSync(PID_FILE);
+      const pidFile = getPidFile(port);
+      if (existsSync(pidFile)) {
+        unlinkSync(pidFile);
       }
     } catch {
       // Ignore errors

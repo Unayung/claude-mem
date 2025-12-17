@@ -213,11 +213,8 @@ export class WorkerService {
         
         await Promise.race([this.initializationComplete, timeoutPromise]);
 
-        // If searchRoutes is still null after initialization, something went wrong
-        if (!this.searchRoutes) {
-          res.status(503).json({ error: 'Search routes not initialized' });
-          return;
-        }
+        // Note: searchRoutes may be null for PostgreSQL backend - that's OK
+        // This handler uses generateContext() directly, not SearchRoutes
 
         // Delegate to the proper handler by re-processing the request
         // Since we're already in the middleware chain, we need to call the handler directly
@@ -335,16 +332,35 @@ export class WorkerService {
       // Initialize search services (requires initialized database)
       const formattingService = new FormattingService();
       const timelineService = new TimelineService();
-      const searchManager = new SearchManager(
-        this.dbManager.getSessionSearch(),
-        this.dbManager.getSessionStore(),
-        this.dbManager.getChromaSync(),
-        formattingService,
-        timelineService
-      );
-      this.searchRoutes = new SearchRoutes(searchManager);
-      this.searchRoutes.setupRoutes(this.app); // Setup search routes now that SearchManager is ready
-      logger.info('WORKER', 'SearchManager initialized and search routes registered');
+
+      // SessionSearch may be null for PostgreSQL backend
+      const sessionSearch = this.dbManager.getSessionSearch();
+      if (sessionSearch) {
+        const searchManager = new SearchManager(
+          sessionSearch,
+          this.dbManager.getSQLiteSessionStore(),
+          this.dbManager.getChromaSync(),
+          formattingService,
+          timelineService
+        );
+        this.searchRoutes = new SearchRoutes(searchManager);
+        this.searchRoutes.setupRoutes(this.app);
+        logger.info('WORKER', 'SearchManager initialized and search routes registered');
+      } else {
+        // PostgreSQL backend - search routes use Chroma only (no SQLite FTS)
+        logger.info('WORKER', 'PostgreSQL backend detected - search via Chroma only', {
+          backend: this.dbManager.getBackend()
+        });
+        // Create a minimal search routes placeholder that returns helpful error
+        this.app.use('/api/search', (_req, res) => {
+          res.status(503).json({
+            error: 'Search not yet implemented for PostgreSQL backend',
+            hint: 'Use Chroma MCP tools for semantic search'
+          });
+        });
+        // Mark as initialized so context generation doesn't fail
+        this.searchRoutes = null;
+      }
 
       // Connect to MCP server
       const mcpServerPath = path.join(__dirname, 'mcp-server.cjs');

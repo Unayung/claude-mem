@@ -12,28 +12,27 @@ import { EventEmitter } from 'events';
 import { DatabaseManager } from './DatabaseManager.js';
 import { logger } from '../../utils/logger.js';
 import type { ActiveSession, PendingMessage, PendingMessageWithId, ObservationData } from '../worker-types.js';
-import { PendingMessageStore } from '../sqlite/PendingMessageStore.js';
+import type { PendingMessageStore } from '../sqlite/PendingMessageStore.js';
+
+// Type for PostgreSQL pending store (async methods)
+type PostgresPendingMessageStoreType = import('../postgres/PostgresPendingMessageStore.js').PostgresPendingMessageStore;
 
 export class SessionManager {
   private dbManager: DatabaseManager;
   private sessions: Map<number, ActiveSession> = new Map();
   private sessionQueues: Map<number, EventEmitter> = new Map();
   private onSessionDeletedCallback?: () => void;
-  private pendingStore: PendingMessageStore | null = null;
 
   constructor(dbManager: DatabaseManager) {
     this.dbManager = dbManager;
   }
 
   /**
-   * Get or create PendingMessageStore (lazy initialization to avoid circular dependency)
+   * Get PendingMessageStore from DatabaseManager
+   * Returns either SQLite (sync) or PostgreSQL (async) store depending on backend
    */
-  private getPendingStore(): PendingMessageStore {
-    if (!this.pendingStore) {
-      const sessionStore = this.dbManager.getSessionStore();
-      this.pendingStore = new PendingMessageStore(sessionStore.db, 3);
-    }
-    return this.pendingStore;
+  private getPendingStore(): PendingMessageStore | PostgresPendingMessageStoreType {
+    return this.dbManager.getPendingMessageStore();
   }
 
   /**
@@ -45,15 +44,16 @@ export class SessionManager {
 
   /**
    * Initialize a new session or return existing one
+   * Note: Async to support both SQLite (sync) and PostgreSQL (async) backends
    */
-  initializeSession(sessionDbId: number, currentUserPrompt?: string, promptNumber?: number): ActiveSession {
+  async initializeSession(sessionDbId: number, currentUserPrompt?: string, promptNumber?: number): Promise<ActiveSession> {
     // Check if already active
     let session = this.sessions.get(sessionDbId);
     if (session) {
       // Refresh project from database in case it was updated by new-hook
       // This fixes the bug where sessions created with empty project get updated
       // in the database but the in-memory session still has the stale empty value
-      const dbSession = this.dbManager.getSessionById(sessionDbId);
+      const dbSession = await this.dbManager.getSessionByIdAsync(sessionDbId);
       if (dbSession.project && dbSession.project !== session.project) {
         logger.debug('SESSION', 'Updating project from database', {
           sessionDbId,
@@ -84,7 +84,7 @@ export class SessionManager {
     }
 
     // Fetch from database
-    const dbSession = this.dbManager.getSessionById(sessionDbId);
+    const dbSession = await this.dbManager.getSessionByIdAsync(sessionDbId);
 
     // Use currentUserPrompt if provided, otherwise fall back to database (first prompt)
     const userPrompt = currentUserPrompt || dbSession.user_prompt;
@@ -103,6 +103,11 @@ export class SessionManager {
       });
     }
 
+    // Get prompt counter (async for PostgreSQL)
+    const lastPromptNum = promptNumber || await Promise.resolve(
+      this.dbManager.getSessionStore().getPromptCounter(sessionDbId)
+    );
+
     // Create active session
     session = {
       sessionDbId,
@@ -113,7 +118,7 @@ export class SessionManager {
       pendingMessages: [],
       abortController: new AbortController(),
       generatorPromise: null,
-      lastPromptNumber: promptNumber || this.dbManager.getSessionStore().getPromptCounter(sessionDbId),
+      lastPromptNumber: lastPromptNum,
       startTime: Date.now(),
       cumulativeInputTokens: 0,
       cumulativeOutputTokens: 0,
@@ -151,11 +156,11 @@ export class SessionManager {
    * CRITICAL: Persists to database FIRST before adding to in-memory queue.
    * This ensures observations survive worker crashes.
    */
-  queueObservation(sessionDbId: number, data: ObservationData): void {
+  async queueObservation(sessionDbId: number, data: ObservationData): Promise<void> {
     // Auto-initialize from database if needed (handles worker restarts)
     let session = this.sessions.get(sessionDbId);
     if (!session) {
-      session = this.initializeSession(sessionDbId);
+      session = await this.initializeSession(sessionDbId);
     }
 
     const beforeDepth = session.pendingMessages.length;
@@ -171,7 +176,10 @@ export class SessionManager {
     };
 
     try {
-      const messageId = this.getPendingStore().enqueue(sessionDbId, session.claudeSessionId, message);
+      // Await handles both sync (SQLite) and async (PostgreSQL) stores
+      const messageId = await Promise.resolve(
+        this.getPendingStore().enqueue(sessionDbId, session.claudeSessionId, message)
+      );
       logger.debug('SESSION', `Observation persisted to DB`, {
         sessionId: sessionDbId,
         messageId,
@@ -211,11 +219,11 @@ export class SessionManager {
    * CRITICAL: Persists to database FIRST before adding to in-memory queue.
    * This ensures summarize requests survive worker crashes.
    */
-  queueSummarize(sessionDbId: number, lastUserMessage: string, lastAssistantMessage?: string): void {
+  async queueSummarize(sessionDbId: number, lastUserMessage: string, lastAssistantMessage?: string): Promise<void> {
     // Auto-initialize from database if needed (handles worker restarts)
     let session = this.sessions.get(sessionDbId);
     if (!session) {
-      session = this.initializeSession(sessionDbId);
+      session = await this.initializeSession(sessionDbId);
     }
 
     const beforeDepth = session.pendingMessages.length;
@@ -228,7 +236,10 @@ export class SessionManager {
     };
 
     try {
-      const messageId = this.getPendingStore().enqueue(sessionDbId, session.claudeSessionId, message);
+      // Await handles both sync (SQLite) and async (PostgreSQL) stores
+      const messageId = await Promise.resolve(
+        this.getPendingStore().enqueue(sessionDbId, session.claudeSessionId, message)
+      );
       logger.debug('SESSION', `Summarize persisted to DB`, {
         sessionId: sessionDbId,
         messageId
@@ -371,7 +382,7 @@ export class SessionManager {
     // Auto-initialize from database if needed (handles worker restarts)
     let session = this.sessions.get(sessionDbId);
     if (!session) {
-      session = this.initializeSession(sessionDbId);
+      session = await this.initializeSession(sessionDbId);
     }
 
     const emitter = this.sessionQueues.get(sessionDbId);
@@ -385,7 +396,10 @@ export class SessionManager {
 
     while (!session.abortController.signal.aborted) {
       // Check for pending messages in persistent store
-      const persistentMessage = this.getPendingStore().peekPending(sessionDbId);
+      // Await handles both sync (SQLite) and async (PostgreSQL) stores
+      const persistentMessage = await Promise.resolve(
+        this.getPendingStore().peekPending(sessionDbId)
+      );
 
       if (!persistentMessage) {
         // Wait for new messages with timeout
@@ -424,7 +438,9 @@ export class SessionManager {
         });
 
         // Re-check for messages after waking up (handles race condition)
-        const recheckMessage = this.getPendingStore().peekPending(sessionDbId);
+        const recheckMessage = await Promise.resolve(
+          this.getPendingStore().peekPending(sessionDbId)
+        );
         if (recheckMessage) {
           // Got a message, continue processing
           continue;
@@ -440,7 +456,7 @@ export class SessionManager {
       }
 
       // Mark as processing BEFORE yielding (status: pending -> processing)
-      this.getPendingStore().markProcessing(persistentMessage.id);
+      await Promise.resolve(this.getPendingStore().markProcessing(persistentMessage.id));
 
       // Track this message ID for completion marking
       session.pendingProcessingIds.add(persistentMessage.id);
@@ -471,8 +487,9 @@ export class SessionManager {
 
   /**
    * Get the PendingMessageStore (for SDKAgent to mark messages as processed)
+   * Returns either SQLite (sync) or PostgreSQL (async) store depending on backend
    */
-  getPendingMessageStore(): PendingMessageStore {
+  getPendingMessageStore(): PendingMessageStore | PostgresPendingMessageStoreType {
     return this.getPendingStore();
   }
 }

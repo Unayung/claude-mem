@@ -401,7 +401,8 @@ export class SDKAgent {
     const pendingMessageStore = this.sessionManager.getPendingMessageStore();
     if (session.pendingProcessingIds.size > 0) {
       for (const messageId of session.pendingProcessingIds) {
-        pendingMessageStore.markProcessed(messageId);
+        // Await handles both sync (SQLite) and async (PostgreSQL) stores
+        await Promise.resolve(pendingMessageStore.markProcessed(messageId));
       }
       logger.debug('SDK', 'Messages marked as processed', {
         sessionId: session.sessionDbId,
@@ -411,7 +412,7 @@ export class SDKAgent {
       session.pendingProcessingIds.clear();
 
       // Clean up old processed messages (keep last 100 for UI display)
-      const deletedCount = pendingMessageStore.cleanupProcessed(100);
+      const deletedCount = await Promise.resolve(pendingMessageStore.cleanupProcessed(100));
       if (deletedCount > 0) {
         logger.debug('SDK', 'Cleaned up old processed messages', {
           deletedCount

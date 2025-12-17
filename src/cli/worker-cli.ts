@@ -9,7 +9,7 @@ async function main() {
     case 'start': {
       const result = await ProcessManager.start(port);
       if (result.success) {
-        console.log(`Worker started (PID: ${result.pid})`);
+        console.log(`Worker started (PID: ${result.pid}) on port ${port}`);
         const date = new Date().toISOString().slice(0, 10);
         console.log(`Logs: ~/.claude-mem/logs/worker-${date}.log`);
         process.exit(0);
@@ -21,15 +21,15 @@ async function main() {
     }
 
     case 'stop': {
-      await ProcessManager.stop();
-      console.log('Worker stopped');
+      await ProcessManager.stop(port);
+      console.log(`Worker stopped (port ${port})`);
       process.exit(0);
     }
 
     case 'restart': {
       const result = await ProcessManager.restart(port);
       if (result.success) {
-        console.log(`Worker restarted (PID: ${result.pid})`);
+        console.log(`Worker restarted (PID: ${result.pid}) on port ${port}`);
         process.exit(0);
       } else {
         console.error(`Failed to restart: ${result.error}`);
@@ -39,14 +39,14 @@ async function main() {
     }
 
     case 'status': {
-      const status = await ProcessManager.status();
+      const status = await ProcessManager.status(port);
       if (status.running) {
         console.log('Worker is running');
         console.log(`  PID: ${status.pid}`);
         console.log(`  Port: ${status.port}`);
         console.log(`  Uptime: ${status.uptime}`);
       } else {
-        console.log('Worker is not running');
+        console.log(`Worker is not running on port ${port}`);
       }
       process.exit(0);
     }
