@@ -53,6 +53,27 @@ export class PaginationHelper {
   }
 
   /**
+   * Normalize PostgreSQL JSONB fields to JSON strings for viewer compatibility.
+   * PostgreSQL returns JSONB as native arrays/objects, but SQLite returns TEXT.
+   * The viewer expects JSON strings for parsing.
+   */
+  private normalizeJsonFields<T extends Record<string, any>>(item: T, fields: string[]): T {
+    const result = { ...item };
+    for (const field of fields) {
+      const value = result[field];
+      // If it's already a string or null/undefined, leave as-is
+      if (value === null || value === undefined || typeof value === 'string') {
+        continue;
+      }
+      // If it's an array or object (PostgreSQL JSONB), stringify it
+      if (Array.isArray(value) || typeof value === 'object') {
+        (result as any)[field] = JSON.stringify(value);
+      }
+    }
+    return result;
+  }
+
+  /**
    * Strip project path from file paths using heuristic
    * Converts "/Users/user/project/src/file.ts" -> "src/file.ts"
    * Uses first occurrence of project name from left (project root)
@@ -92,13 +113,15 @@ export class PaginationHelper {
   }
 
   /**
-   * Sanitize observation by stripping project paths from files
+   * Sanitize observation by normalizing JSON fields and stripping project paths
    */
   private sanitizeObservation(obs: Observation): Observation {
+    // First normalize JSONB fields to strings for PostgreSQL compatibility
+    const normalized = this.normalizeJsonFields(obs, ['facts', 'concepts', 'files_read', 'files_modified']);
     return {
-      ...obs,
-      files_read: this.stripProjectPaths(obs.files_read, obs.project),
-      files_modified: this.stripProjectPaths(obs.files_modified, obs.project)
+      ...normalized,
+      files_read: this.stripProjectPaths(normalized.files_read, normalized.project),
+      files_modified: this.stripProjectPaths(normalized.files_modified, normalized.project)
     };
   }
 

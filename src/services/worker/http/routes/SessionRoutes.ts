@@ -7,6 +7,7 @@
 
 import express, { Request, Response } from 'express';
 import { getWorkerPort } from '../../../../shared/worker-utils.js';
+import { replicateSessionInit, replicateUserPrompt } from '../../../../shared/replication-utils.js';
 import { logger } from '../../../../utils/logger.js';
 import { stripMemoryTagsFromJson, stripMemoryTagsFromPrompt } from '../../../../utils/tag-stripping.js';
 import { SessionManager } from '../../SessionManager.js';
@@ -76,6 +77,12 @@ export class SessionRoutes extends BaseRouteHandler {
     app.post('/api/sessions/observations', this.handleObservationsByClaudeId.bind(this));
     app.post('/api/sessions/summarize', this.handleSummarizeByClaudeId.bind(this));
     app.post('/api/sessions/complete', this.handleSessionCompleteByClaudeId.bind(this));
+
+    // Replication endpoints (receive pre-processed data from primary worker)
+    app.post('/api/replicate/observation', this.handleReplicateObservation.bind(this));
+    app.post('/api/replicate/summary', this.handleReplicateSummary.bind(this));
+    app.post('/api/replicate/session', this.handleReplicateSession.bind(this));
+    app.post('/api/replicate/prompt', this.handleReplicatePrompt.bind(this));
   }
 
   /**
@@ -491,6 +498,15 @@ export class SessionRoutes extends BaseRouteHandler {
     // Step 5: Save cleaned user prompt
     await Promise.resolve(store.saveUserPrompt(claudeSessionId, promptNumber, cleanedPrompt));
 
+    // Step 6: Replicate session and prompt to secondary ports (fire-and-forget)
+    replicateSessionInit({
+      claudeSessionId,
+      project,
+      prompt: cleanedPrompt,
+      sessionDbId,
+      promptNumber
+    });
+
     logger.info('SESSION', 'Session initialized via HTTP', {
       sessionId: sessionDbId,
       promptNumber,
@@ -502,5 +518,144 @@ export class SessionRoutes extends BaseRouteHandler {
       promptNumber,
       skipped: false
     });
+  });
+
+  // ============================================
+  // Replication Endpoints (no AI processing)
+  // ============================================
+
+  /**
+   * Receive replicated observation from primary worker
+   * POST /api/replicate/observation
+   * Body: { claudeSessionId, project, observation, promptNumber, discoveryTokens, obsId, createdAtEpoch }
+   *
+   * Stores pre-processed observation directly without AI processing
+   */
+  private handleReplicateObservation = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
+    const { claudeSessionId, project, observation, promptNumber, discoveryTokens } = req.body;
+
+    if (!claudeSessionId || !observation) {
+      return this.badRequest(res, 'Missing claudeSessionId or observation');
+    }
+
+    const store = this.dbManager.getSessionStore();
+
+    // Ensure session exists (create if needed)
+    await Promise.resolve(store.createSDKSession(claudeSessionId, project || '', ''));
+
+    // Store the pre-processed observation directly
+    const { id: localObsId, createdAtEpoch: localCreatedAt } = store.storeObservation(
+      claudeSessionId,
+      project || '',
+      observation,
+      promptNumber || 0,
+      discoveryTokens || 0
+    );
+
+    logger.debug('REPLICATION', 'Observation replicated', {
+      originalObsId: req.body.obsId,
+      localObsId,
+      type: observation.type,
+      title: observation.title
+    });
+
+    res.json({ success: true, localObsId });
+  });
+
+  /**
+   * Receive replicated summary from primary worker
+   * POST /api/replicate/summary
+   * Body: { claudeSessionId, project, summary, promptNumber, discoveryTokens, summaryId, createdAtEpoch }
+   *
+   * Stores pre-processed summary directly without AI processing
+   */
+  private handleReplicateSummary = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
+    const { claudeSessionId, project, summary, promptNumber, discoveryTokens } = req.body;
+
+    if (!claudeSessionId || !summary) {
+      return this.badRequest(res, 'Missing claudeSessionId or summary');
+    }
+
+    const store = this.dbManager.getSessionStore();
+
+    // Ensure session exists (create if needed)
+    await Promise.resolve(store.createSDKSession(claudeSessionId, project || '', ''));
+
+    // Store the pre-processed summary directly
+    const { id: localSummaryId, createdAtEpoch: localCreatedAt } = store.storeSummary(
+      claudeSessionId,
+      project || '',
+      summary,
+      promptNumber || 0,
+      discoveryTokens || 0
+    );
+
+    logger.debug('REPLICATION', 'Summary replicated', {
+      originalSummaryId: req.body.summaryId,
+      localSummaryId,
+      request: summary.request
+    });
+
+    res.json({ success: true, localSummaryId });
+  });
+
+  /**
+   * Receive replicated session init from primary worker
+   * POST /api/replicate/session
+   * Body: { claudeSessionId, project, prompt, sessionDbId, promptNumber }
+   *
+   * Creates session and stores prompt without triggering SDK agent
+   */
+  private handleReplicateSession = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
+    const { claudeSessionId, project, prompt, promptNumber } = req.body;
+
+    if (!claudeSessionId) {
+      return this.badRequest(res, 'Missing claudeSessionId');
+    }
+
+    const store = this.dbManager.getSessionStore();
+
+    // Create session
+    const sessionDbId = await Promise.resolve(store.createSDKSession(claudeSessionId, project || '', ''));
+
+    // Store prompt if provided
+    if (prompt && promptNumber) {
+      await Promise.resolve(store.saveUserPrompt(claudeSessionId, promptNumber, prompt));
+    }
+
+    logger.debug('REPLICATION', 'Session replicated', {
+      claudeSessionId,
+      localSessionDbId: sessionDbId
+    });
+
+    res.json({ success: true, sessionDbId });
+  });
+
+  /**
+   * Receive replicated user prompt from primary worker
+   * POST /api/replicate/prompt
+   * Body: { claudeSessionId, promptNumber, promptText }
+   */
+  private handleReplicatePrompt = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
+    const { claudeSessionId, promptNumber, promptText } = req.body;
+
+    if (!claudeSessionId || !promptNumber || !promptText) {
+      return this.badRequest(res, 'Missing required fields');
+    }
+
+    const store = this.dbManager.getSessionStore();
+
+    // Ensure session exists
+    await Promise.resolve(store.createSDKSession(claudeSessionId, '', ''));
+
+    // Store the prompt
+    await Promise.resolve(store.saveUserPrompt(claudeSessionId, promptNumber, promptText));
+
+    logger.debug('REPLICATION', 'Prompt replicated', {
+      claudeSessionId,
+      promptNumber
+    });
+
+    res.json({ success: true });
   });
 }

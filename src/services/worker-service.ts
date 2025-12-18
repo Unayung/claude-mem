@@ -347,17 +347,72 @@ export class WorkerService {
         this.searchRoutes.setupRoutes(this.app);
         logger.info('WORKER', 'SearchManager initialized and search routes registered');
       } else {
-        // PostgreSQL backend - search routes use Chroma only (no SQLite FTS)
-        logger.info('WORKER', 'PostgreSQL backend detected - search via Chroma only', {
+        // PostgreSQL backend - limited search routes (context works, search uses Chroma)
+        logger.info('WORKER', 'PostgreSQL backend detected - registering limited routes', {
           backend: this.dbManager.getBackend()
         });
-        // Create a minimal search routes placeholder that returns helpful error
+
+        // Context preview works with PostgreSQL (generateContext supports both backends)
+        this.app.get('/api/context/preview', async (req, res) => {
+          try {
+            const projectName = req.query.project as string;
+            if (!projectName) {
+              res.status(400).json({ error: 'Project parameter is required' });
+              return;
+            }
+
+            const { generateContext } = await import('./context-generator.js');
+            const cwd = `/preview/${projectName}`;
+            const contextText = await generateContext(
+              { session_id: 'preview-' + Date.now(), cwd },
+              true // useColors=true
+            );
+            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+            res.send(contextText);
+          } catch (error: any) {
+            logger.error('WORKER', 'Context preview failed', {}, error);
+            res.status(500).json({ error: error.message });
+          }
+        });
+
+        // Context inject works with PostgreSQL
+        this.app.get('/api/context/inject', async (req, res) => {
+          try {
+            const projectName = req.query.project as string;
+            const useColors = req.query.colors === 'true';
+            if (!projectName) {
+              res.status(400).json({ error: 'Project parameter is required' });
+              return;
+            }
+
+            const { generateContext } = await import('./context-generator.js');
+            const cwd = `/inject/${projectName}`;
+            const contextText = await generateContext(
+              { session_id: 'inject-' + Date.now(), cwd },
+              useColors
+            );
+            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+            res.send(contextText);
+          } catch (error: any) {
+            logger.error('WORKER', 'Context inject failed', {}, error);
+            res.status(500).json({ error: error.message });
+          }
+        });
+
+        // Search and timeline not yet implemented for PostgreSQL
         this.app.use('/api/search', (_req, res) => {
           res.status(503).json({
             error: 'Search not yet implemented for PostgreSQL backend',
             hint: 'Use Chroma MCP tools for semantic search'
           });
         });
+        this.app.use('/api/timeline', (_req, res) => {
+          res.status(503).json({
+            error: 'Timeline not yet implemented for PostgreSQL backend',
+            hint: 'Use the viewer feed for chronological view'
+          });
+        });
+
         // Mark as initialized so context generation doesn't fail
         this.searchRoutes = null;
       }

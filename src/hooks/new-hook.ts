@@ -4,6 +4,7 @@ import { createHookResponse } from './hook-response.js';
 import { ensureWorkerRunning, getWorkerPort } from '../shared/worker-utils.js';
 import { handleWorkerError } from '../shared/hook-error-handler.js';
 import { handleFetchError } from './shared/error-handler.js';
+import { HOOK_TIMEOUTS } from '../shared/hook-constants.js';
 
 export interface UserPromptSubmitInput {
   session_id: string;
@@ -25,10 +26,10 @@ async function newHook(input?: UserPromptSubmitInput): Promise<void> {
 
   const { session_id, cwd, prompt } = input;
   const project = path.basename(cwd);
-
   const port = getWorkerPort();
 
   // Initialize session via HTTP - handles DB operations and privacy checks
+  // Primary worker handles replication to secondary ports after processing
   let sessionDbId: number;
   let promptNumber: number;
 
@@ -41,7 +42,7 @@ async function newHook(input?: UserPromptSubmitInput): Promise<void> {
         project,
         prompt
       }),
-      signal: AbortSignal.timeout(5000)
+      signal: AbortSignal.timeout(HOOK_TIMEOUTS.DEFAULT)
     });
 
     if (!initResponse.ok) {
@@ -49,8 +50,7 @@ async function newHook(input?: UserPromptSubmitInput): Promise<void> {
       handleFetchError(initResponse, errorText, {
         hookName: 'new',
         operation: 'Session initialization',
-        project,
-        port
+        project
       });
     }
 
@@ -76,11 +76,15 @@ async function newHook(input?: UserPromptSubmitInput): Promise<void> {
 
   try {
     // Initialize SDK agent session via HTTP (starts the agent!)
+    // Only runs on primary - secondary ports receive replicated results
     const response = await fetch(`http://127.0.0.1:${port}/sessions/${sessionDbId}/init`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userPrompt: cleanedPrompt, promptNumber }),
-      signal: AbortSignal.timeout(5000)
+      body: JSON.stringify({
+        userPrompt: cleanedPrompt,
+        promptNumber
+      }),
+      signal: AbortSignal.timeout(HOOK_TIMEOUTS.DEFAULT)
     });
 
     if (!response.ok) {
@@ -89,7 +93,6 @@ async function newHook(input?: UserPromptSubmitInput): Promise<void> {
         hookName: 'new',
         operation: 'SDK agent start',
         project,
-        port,
         sessionId: String(sessionDbId)
       });
     }

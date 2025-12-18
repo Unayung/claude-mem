@@ -18,6 +18,7 @@ import { parseObservations, parseSummary } from '../../sdk/parser.js';
 import { buildInitPrompt, buildObservationPrompt, buildSummaryPrompt, buildContinuationPrompt } from '../../sdk/prompts.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH } from '../../shared/paths.js';
+import { replicateObservation, replicateSummary } from '../../shared/replication-utils.js';
 import type { ActiveSession, SDKUserMessage, PendingMessage } from '../worker-types.js';
 
 // Import Agent SDK (assumes it's installed)
@@ -273,6 +274,17 @@ export class SDKAgent {
         concepts: obs.concepts?.length ?? 0
       });
 
+      // Replicate to secondary ports (fire-and-forget, no await)
+      replicateObservation({
+        claudeSessionId: session.claudeSessionId,
+        project: session.project,
+        observation: obs,
+        promptNumber: session.lastPromptNumber,
+        discoveryTokens,
+        obsId,
+        createdAtEpoch
+      });
+
       // Sync to Chroma with error logging
       const chromaStart = Date.now();
       const obsType = obs.type;
@@ -347,6 +359,17 @@ export class SDKAgent {
         request: summary.request || '(no request)',
         hasCompleted: !!summary.completed,
         hasNextSteps: !!summary.next_steps
+      });
+
+      // Replicate to secondary ports (fire-and-forget, no await)
+      replicateSummary({
+        claudeSessionId: session.claudeSessionId,
+        project: session.project,
+        summary,
+        promptNumber: session.lastPromptNumber,
+        discoveryTokens,
+        summaryId,
+        createdAtEpoch
       });
 
       // Sync to Chroma with error logging

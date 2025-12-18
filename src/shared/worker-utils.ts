@@ -15,6 +15,10 @@ const HEALTH_CHECK_TIMEOUT_MS = getTimeout(HOOK_TIMEOUTS.HEALTH_CHECK);
 
 // Port cache to avoid repeated settings file reads
 let cachedPort: number | null = null;
+let cachedPorts: number[] | null = null;
+
+// Default primary port (SQLite worker)
+const DEFAULT_PRIMARY_PORT = 37777;
 
 /**
  * Get the worker port number from settings
@@ -55,6 +59,157 @@ export function getWorkerPort(): number {
  */
 export function clearPortCache(): void {
   cachedPort = null;
+  cachedPorts = null;
+}
+
+/**
+ * Get all worker ports to send data to (multi-port fan-out support)
+ *
+ * Primary port (37777 default) is ALWAYS included - it's the local SQLite worker.
+ * Additional ports from CLAUDE_MEM_WORKER_PORTS are added for team sharing (e.g., PostgreSQL).
+ *
+ * Example:
+ *   CLAUDE_MEM_WORKER_PORTS=38888,39999 → returns [37777, 38888, 39999]
+ *   (no env var set) → returns [37777]
+ *
+ * @returns Array of unique port numbers, primary port always first
+ */
+export function getWorkerPorts(): number[] {
+  if (cachedPorts !== null) {
+    return cachedPorts;
+  }
+
+  const ports = new Set<number>();
+
+  // 1. Always include the primary port (local SQLite worker)
+  const primaryPort = getWorkerPort();
+  ports.add(primaryPort);
+
+  // 2. Add additional ports from CLAUDE_MEM_WORKER_PORTS env var
+  const additionalPortsEnv = process.env.CLAUDE_MEM_WORKER_PORTS;
+  if (additionalPortsEnv) {
+    const additionalPorts = additionalPortsEnv
+      .split(',')
+      .map(p => parseInt(p.trim(), 10))
+      .filter(p => !isNaN(p) && p >= 1024 && p <= 65535);
+
+    for (const port of additionalPorts) {
+      ports.add(port);
+    }
+  }
+
+  // Convert to array with primary port first
+  cachedPorts = [primaryPort, ...Array.from(ports).filter(p => p !== primaryPort)];
+  return cachedPorts;
+}
+
+/**
+ * Check if multi-port mode is enabled
+ * @returns true if additional ports are configured beyond the primary
+ */
+export function isMultiPortEnabled(): boolean {
+  return getWorkerPorts().length > 1;
+}
+
+/**
+ * Fan-out a request to all configured worker ports
+ *
+ * Sends the same request to all ports in parallel. Primary port (37777) failures
+ * are critical and will throw. Secondary port failures are logged but don't fail
+ * the overall operation.
+ *
+ * @param path - URL path (e.g., '/api/session/123/observations')
+ * @param options - Fetch options (method, body, headers, etc.)
+ * @returns Response from the primary port
+ */
+export async function fanOutRequest(
+  path: string,
+  options: RequestInit = {}
+): Promise<Response> {
+  const ports = getWorkerPorts();
+  const host = getWorkerHost();
+
+  // Send to all ports in parallel
+  const requests = ports.map(async (port, index) => {
+    const url = `http://${host}:${port}${path}`;
+    const isPrimary = index === 0;
+
+    try {
+      const response = await fetch(url, options);
+
+      if (!response.ok && isPrimary) {
+        // Primary port failure is critical
+        const errorText = await response.text().catch(() => 'Unknown error');
+        throw new Error(`Primary worker (port ${port}) returned ${response.status}: ${errorText}`);
+      }
+
+      if (!response.ok && !isPrimary) {
+        // Secondary port failure - log but don't fail
+        logger.warn('MULTI_PORT', `Secondary worker (port ${port}) returned ${response.status}`, {
+          path,
+          port,
+          status: response.status
+        });
+      }
+
+      return { port, response, isPrimary, success: response.ok };
+    } catch (error: any) {
+      if (isPrimary) {
+        // Primary port failure is critical
+        throw error;
+      }
+
+      // Secondary port failure - log but don't fail
+      logger.warn('MULTI_PORT', `Secondary worker (port ${port}) request failed`, {
+        path,
+        port,
+        error: error.message
+      });
+
+      return { port, response: null, isPrimary, success: false };
+    }
+  });
+
+  const results = await Promise.all(requests);
+
+  // Return the primary port's response
+  const primaryResult = results.find(r => r.isPrimary);
+  if (!primaryResult?.response) {
+    throw new Error('Primary worker request failed');
+  }
+
+  // Log multi-port status if enabled
+  if (ports.length > 1) {
+    const successCount = results.filter(r => r.success).length;
+    logger.debug('MULTI_PORT', `Fan-out complete: ${successCount}/${ports.length} ports succeeded`, {
+      path,
+      ports: results.map(r => ({ port: r.port, success: r.success }))
+    });
+  }
+
+  return primaryResult.response;
+}
+
+/**
+ * Fan-out a POST request with JSON body to all configured worker ports
+ * Convenience wrapper around fanOutRequest for JSON POST requests
+ */
+export async function fanOutPost(
+  path: string,
+  body: any,
+  timeoutMs?: number
+): Promise<Response> {
+  const options: RequestInit = {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  };
+
+  if (timeoutMs) {
+    options.signal = AbortSignal.timeout(timeoutMs);
+  }
+
+  return fanOutRequest(path, options);
 }
 
 /**

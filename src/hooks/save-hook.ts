@@ -34,17 +34,15 @@ async function saveHook(input?: PostToolUseInput): Promise<void> {
   }
 
   const { session_id, cwd, tool_name, tool_input, tool_response } = input;
-
   const port = getWorkerPort();
 
   const toolStr = logger.formatTool(tool_name, tool_input);
 
-  logger.dataIn('HOOK', `PostToolUse: ${toolStr}`, {
-    workerPort: port
-  });
+  logger.dataIn('HOOK', `PostToolUse: ${toolStr}`, {});
 
   try {
     // Send to worker - worker handles privacy check and database operations
+    // Primary worker handles replication to secondary ports after AI processing
     const response = await fetch(`http://127.0.0.1:${port}/api/sessions/observations`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -70,8 +68,7 @@ async function saveHook(input?: PostToolUseInput): Promise<void> {
         hookName: 'save',
         operation: 'Observation storage',
         toolName: tool_name,
-        sessionId: session_id,
-        port
+        sessionId: session_id
       });
     }
 

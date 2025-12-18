@@ -3,12 +3,30 @@
  *
  * This module contains all the logic for building the context injection string.
  * It's used by the worker service and called via HTTP from the context-hook.
+ * Supports both SQLite and PostgreSQL backends.
  */
 
 import path from 'path';
 import { homedir } from 'os';
 import { existsSync, readFileSync, unlinkSync } from 'fs';
 import { SessionStore } from './sqlite/SessionStore.js';
+
+// PostgreSQL support (dynamic import to avoid loading when using SQLite)
+type PgQueryFn = typeof import('./postgres/pool.js').query;
+let pgQuery: PgQueryFn | null = null;
+
+async function getPgQuery(): Promise<PgQueryFn> {
+  if (!pgQuery) {
+    const { query } = await import('./postgres/pool.js');
+    pgQuery = query;
+  }
+  return pgQuery;
+}
+
+function isPostgres(): boolean {
+  const dbType = process.env.CLAUDE_MEM_DATABASE?.toLowerCase();
+  return dbType === 'postgres' || dbType === 'postgresql';
+}
 import {
   OBSERVATION_TYPES,
   OBSERVATION_CONCEPTS,
@@ -224,55 +242,120 @@ export async function generateContext(input?: ContextInput, useColors: boolean =
   const cwd = input?.cwd ?? process.cwd();
   const project = cwd ? path.basename(cwd) : 'unknown-project';
 
-  let db: SessionStore | null = null;
-  try {
-    db = new SessionStore();
-  } catch (error: any) {
-    if (error.code === 'ERR_DLOPEN_FAILED') {
-      try {
-        unlinkSync(VERSION_MARKER_PATH);
-      } catch (unlinkError) {
-        // Marker might not exist
-      }
-      console.error('Native module rebuild needed - restart Claude Code to auto-fix');
-      return '';
-    }
-    throw error;
-  }
+  let observations: Observation[];
+  let recentSummaries: SessionSummary[];
 
-  // Build SQL WHERE clause for observation types
+  // Build arrays for type and concept filtering
   const typeArray = Array.from(config.observationTypes);
-  const typePlaceholders = typeArray.map(() => '?').join(',');
-
-  // Build SQL WHERE clause for concepts
   const conceptArray = Array.from(config.observationConcepts);
-  const conceptPlaceholders = conceptArray.map(() => '?').join(',');
 
-  // Get recent observations
-  const observations = db.db.prepare(`
-    SELECT
-      id, sdk_session_id, type, title, subtitle, narrative,
-      facts, concepts, files_read, files_modified, discovery_tokens,
-      created_at, created_at_epoch
-    FROM observations
-    WHERE project = ?
-      AND type IN (${typePlaceholders})
-      AND EXISTS (
-        SELECT 1 FROM json_each(concepts)
-        WHERE value IN (${conceptPlaceholders})
-      )
-    ORDER BY created_at_epoch DESC
-    LIMIT ?
-  `).all(project, ...typeArray, ...conceptArray, config.totalObservationCount) as Observation[];
+  if (isPostgres()) {
+    // PostgreSQL backend
+    const query = await getPgQuery();
 
-  // Get recent summaries
-  const recentSummaries = db.db.prepare(`
-    SELECT id, sdk_session_id, request, investigated, learned, completed, next_steps, created_at, created_at_epoch
-    FROM session_summaries
-    WHERE project = ?
-    ORDER BY created_at_epoch DESC
-    LIMIT ?
-  `).all(project, config.sessionCount + SUMMARY_LOOKAHEAD) as SessionSummary[];
+    // Build PostgreSQL parameterized query for observations
+    // PostgreSQL uses $1, $2, etc. for parameters and jsonb_array_elements_text for JSON arrays
+    let paramIndex = 1;
+    const obsParams: any[] = [];
+
+    // Build type placeholders: $2, $3, $4, etc.
+    const typePlaceholders = typeArray.map(() => `$${paramIndex++}`).join(',');
+    obsParams.push(...typeArray);
+
+    // Build concept placeholders: $5, $6, $7, etc.
+    const conceptPlaceholders = conceptArray.map(() => `$${paramIndex++}`).join(',');
+    obsParams.push(...conceptArray);
+
+    const obsResult = await query<Observation>(`
+      SELECT
+        id, sdk_session_id, type, title, subtitle, narrative,
+        facts, concepts, files_read, files_modified, discovery_tokens,
+        created_at, created_at_epoch
+      FROM observations
+      WHERE project = $${paramIndex++}
+        AND type IN (${typePlaceholders})
+        AND EXISTS (
+          SELECT 1 FROM jsonb_array_elements_text(concepts) AS elem
+          WHERE elem IN (${conceptPlaceholders})
+        )
+      ORDER BY created_at_epoch DESC
+      LIMIT $${paramIndex}
+    `, [...obsParams, project, config.totalObservationCount]);
+
+    // Normalize JSONB arrays to strings and epoch to number
+    observations = obsResult.rows.map(row => ({
+      ...row,
+      created_at_epoch: typeof row.created_at_epoch === 'string' ? parseInt(row.created_at_epoch, 10) : row.created_at_epoch,
+      facts: Array.isArray(row.facts) ? JSON.stringify(row.facts) : row.facts,
+      concepts: Array.isArray(row.concepts) ? JSON.stringify(row.concepts) : row.concepts,
+      files_read: Array.isArray(row.files_read) ? JSON.stringify(row.files_read) : row.files_read,
+      files_modified: Array.isArray(row.files_modified) ? JSON.stringify(row.files_modified) : row.files_modified
+    }));
+
+    // Get recent summaries from PostgreSQL
+    const sumResult = await query<SessionSummary>(`
+      SELECT id, sdk_session_id, request, investigated, learned, completed, next_steps, created_at, created_at_epoch
+      FROM session_summaries
+      WHERE project = $1
+      ORDER BY created_at_epoch DESC
+      LIMIT $2
+    `, [project, config.sessionCount + SUMMARY_LOOKAHEAD]);
+
+    recentSummaries = sumResult.rows.map(row => ({
+      ...row,
+      created_at_epoch: typeof row.created_at_epoch === 'string' ? parseInt(row.created_at_epoch, 10) : row.created_at_epoch
+    }));
+
+  } else {
+    // SQLite backend
+    let db: SessionStore | null = null;
+    try {
+      db = new SessionStore();
+    } catch (error: any) {
+      if (error.code === 'ERR_DLOPEN_FAILED') {
+        try {
+          unlinkSync(VERSION_MARKER_PATH);
+        } catch (unlinkError) {
+          // Marker might not exist
+        }
+        console.error('Native module rebuild needed - restart Claude Code to auto-fix');
+        return '';
+      }
+      throw error;
+    }
+
+    // Build SQL WHERE clause for observation types
+    const typePlaceholders = typeArray.map(() => '?').join(',');
+
+    // Build SQL WHERE clause for concepts
+    const conceptPlaceholders = conceptArray.map(() => '?').join(',');
+
+    // Get recent observations
+    observations = db.db.prepare(`
+      SELECT
+        id, sdk_session_id, type, title, subtitle, narrative,
+        facts, concepts, files_read, files_modified, discovery_tokens,
+        created_at, created_at_epoch
+      FROM observations
+      WHERE project = ?
+        AND type IN (${typePlaceholders})
+        AND EXISTS (
+          SELECT 1 FROM json_each(concepts)
+          WHERE value IN (${conceptPlaceholders})
+        )
+      ORDER BY created_at_epoch DESC
+      LIMIT ?
+    `).all(project, ...typeArray, ...conceptArray, config.totalObservationCount) as Observation[];
+
+    // Get recent summaries
+    recentSummaries = db.db.prepare(`
+      SELECT id, sdk_session_id, request, investigated, learned, completed, next_steps, created_at, created_at_epoch
+      FROM session_summaries
+      WHERE project = ?
+      ORDER BY created_at_epoch DESC
+      LIMIT ?
+    `).all(project, config.sessionCount + SUMMARY_LOOKAHEAD) as SessionSummary[];
+  }
 
   // Retrieve prior session messages if enabled
   let priorUserMessage = '';
@@ -298,7 +381,7 @@ export async function generateContext(input?: ContextInput, useColors: boolean =
 
   // If we have neither observations nor summaries, show empty state
   if (observations.length === 0 && recentSummaries.length === 0) {
-    db?.close();
+    // Note: SQLite db closed via block scope, PostgreSQL uses connection pool
     if (useColors) {
       return `\n${colors.bright}${colors.cyan}[${project}] recent context${colors.reset}\n${colors.gray}${'─'.repeat(60)}${colors.reset}\n\n${colors.dim}No previous sessions found for this project yet.${colors.reset}\n`;
     }
@@ -660,6 +743,6 @@ export async function generateContext(input?: ContextInput, useColors: boolean =
     }
   }
 
-  db?.close();
+  // Note: SQLite db was declared in block scope, PostgreSQL uses connection pool (no cleanup needed)
   return output.join('\n').trimEnd();
 }

@@ -58,6 +58,7 @@ async function summaryHook(input?: StopInput): Promise<void> {
 
   try {
     // Send to worker - worker handles privacy check and database operations
+    // Primary worker handles replication to secondary ports after AI processing
     const response = await fetch(`http://127.0.0.1:${port}/api/sessions/summarize`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
